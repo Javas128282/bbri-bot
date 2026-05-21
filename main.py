@@ -27,7 +27,7 @@ TELEGRAM_TOKEN   = os.environ.get("TELEGRAM_TOKEN",   "ISI_TOKEN_BOT_KAMU")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "ISI_CHAT_ID_KAMU")
 
 BASE_LEN         = int(os.environ.get("BASE_LEN",        "10"))
-BASE_MAX_ATR     = float(os.environ.get("BASE_MAX_ATR",  "2.5"))
+BASE_MAX_ATR     = float(os.environ.get("BASE_MAX_ATR",  "2"))
 ATR_LEN          = int(os.environ.get("ATR_LEN",         "14"))
 LOOKBACK_RETEST  = int(os.environ.get("LOOKBACK_RETEST", "40"))
 
