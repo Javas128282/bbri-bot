@@ -103,30 +103,50 @@ def calc_atr(df: pd.DataFrame, period: int) -> pd.Series:
 # ═══════════════════════════════════════════════
 #  FETCH DATA
 # ═══════════════════════════════════════════════
+TWELVE_DATA_KEY = os.environ.get("TWELVE_DATA_KEY", "ISI_API_KEY_KAMU")
+
 def fetch_data() -> pd.DataFrame | None:
     try:
-        ticker = yf.Ticker(SYMBOL)
-        df     = ticker.history(period="5d", interval="5m")
+        url = "https://api.twelvedata.com/time_series"
+        params = {
+            "symbol":     "XAU/USD",
+            "interval":   "5min",
+            "outputsize": 100,        # ambil 100 bar terakhir
+            "apikey":     TWELVE_DATA_KEY,
+            "format":     "JSON"
+        }
+        resp = requests.get(url, params=params, timeout=15)
+        data = resp.json()
 
-        if df.empty:
-            log.warning("Data kosong dari yfinance")
+        if "values" not in data:
+            log.error(f"Twelve Data error: {data.get('message', data)}")
             return None
 
-        # Pastikan kolom standard
-        df = df[["Open", "High", "Low", "Close", "Volume"]].copy()
+        df = pd.DataFrame(data["values"])
+        df = df.rename(columns={
+            "datetime": "Datetime",
+            "open":     "Open",
+            "high":     "High",
+            "low":      "Low",
+            "close":    "Close",
+            "volume":   "Volume"
+        })
+        df["Datetime"] = pd.to_datetime(df["Datetime"])
+        df = df.set_index("Datetime").sort_index()
+        df = df[["Open", "High", "Low", "Close"]].astype(float)
         df.dropna(inplace=True)
 
         min_bars = BASE_LEN + ATR_LEN + 5
         if len(df) < min_bars:
-            log.warning(f"Data kurang: {len(df)} bar (butuh minimal {min_bars})")
+            log.warning(f"Data kurang: {len(df)} bar")
             return None
 
+        log.info(f"Data OK: {len(df)} bar | Last close: {df['Close'].iloc[-1]:.2f}")
         return df
 
     except Exception as e:
         log.error(f"Gagal fetch data: {e}")
         return None
-
 # ═══════════════════════════════════════════════
 #  LOGIKA BBR UTAMA
 # ═══════════════════════════════════════════════
