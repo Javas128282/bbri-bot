@@ -155,27 +155,39 @@ def get_trend(df: pd.DataFrame) -> str:
 #  MARKET BIAS CHECK
 #  Jalankan setiap 1H candle close
 # ═══════════════════════════════════════════════
+def invert_trend(trend: str) -> str:
+    """Balik arah trend untuk instrumen inverse proxy."""
+    if trend == "bullish": return "bearish"
+    if trend == "bearish": return "bullish"
+    return "unknown"
+
 def check_bias():
+    """
+    Proxy yang digunakan:
+      DXY   → EUR/USD (inverse: EUR/USD bear = DXY bull)
+      US10Y → TLT ETF (inverse: TLT bear = yield naik = US10Y bull)
+      XAUUSD → XAU/USD langsung
+    """
     log.info("── Mengecek Market Bias ──")
     state = load_state()
 
     # Fetch data dengan jeda antar request
-    df_dxy   = fetch_data_twelvedata("DXY",     "1h", 60)
+    df_eurusd = fetch_data_twelvedata("EUR/USD", "1h", 60)   # proxy DXY
     time.sleep(2)
-    df_xau   = fetch_data_twelvedata("XAU/USD", "1h", 60)
+    df_xau    = fetch_data_twelvedata("XAU/USD", "1h", 60)   # XAUUSD langsung
     time.sleep(2)
-    df_us10y = fetch_data_twelvedata("US10Y",   "4h", 30)
+    df_tlt    = fetch_data_twelvedata("TLT",     "4h", 30)   # proxy US10Y
 
-    if df_dxy is None or df_xau is None or df_us10y is None:
+    if df_eurusd is None or df_xau is None or df_tlt is None:
         log.warning("Satu atau lebih data bias gagal diambil, skip bias check.")
         return
 
-    # Tentukan trend masing-masing
-    trend_dxy   = get_trend(df_dxy)
+    # Tentukan trend — EUR/USD dan TLT dibalik karena inverse proxy
+    trend_dxy   = invert_trend(get_trend(df_eurusd))  # inverse EUR/USD
     trend_xau   = get_trend(df_xau)
-    trend_us10y = get_trend(df_us10y)
+    trend_us10y = invert_trend(get_trend(df_tlt))     # inverse TLT
 
-    log.info(f"DXY(1H): {trend_dxy} | XAUUSD(1H): {trend_xau} | US10Y(4H): {trend_us10y}")
+    log.info(f"DXY(1H via EURUSD⁻¹): {trend_dxy} | XAUUSD(1H): {trend_xau} | US10Y(4H via TLT⁻¹): {trend_us10y}")
 
     # ── Tentukan Bias ───────────────────────────
     # SELL : DXY bullish + US10Y bullish + XAUUSD bearish
@@ -221,12 +233,12 @@ def check_bias():
 
         msg = (
             f"{header}\n\n"
-            f"{dxy_icon}  DXY (1H)    : <b>{trend_dxy.upper()}</b>  "
-            f"[MA{MA_FAST} {'>' if trend_dxy=='bullish' else '<'} MA{MA_SLOW}]\n"
-            f"{us10y_icon}  US10Y (4H)  : <b>{trend_us10y.upper()}</b>  "
-            f"[MA{MA_FAST} {'>' if trend_us10y=='bullish' else '<'} MA{MA_SLOW}]\n"
-            f"{xau_icon}  XAUUSD (1H) : <b>{trend_xau.upper()}</b>  "
-            f"[MA{MA_FAST} {'>' if trend_xau=='bullish' else '<'} MA{MA_SLOW}]\n\n"
+            f"{dxy_icon}  DXY (1H)         : <b>{trend_dxy.upper()}</b>  "
+            f"[via EUR/USD inverse]\n"
+            f"{us10y_icon}  US10Y yield (4H) : <b>{trend_us10y.upper()}</b>  "
+            f"[via TLT inverse]\n"
+            f"{xau_icon}  XAUUSD (1H)      : <b>{trend_xau.upper()}</b>  "
+            f"[MA{MA_FAST}/MA{MA_SLOW}]\n\n"
             f"{footer}\n\n"
             f"🕐 {now_str}"
         )
