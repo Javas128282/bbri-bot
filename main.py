@@ -29,7 +29,7 @@ TWELVE_DATA_KEY   = os.environ.get("TWELVE_DATA_KEY",   "ISI_API_KEY_KAMU")
 
 # BBR Parameters
 BASE_LEN          = int(os.environ.get("BASE_LEN",        "10"))
-BASE_MAX_ATR      = float(os.environ.get("BASE_MAX_ATR",  "2.5"))
+BASE_MAX_ATR      = float(os.environ.get("BASE_MAX_ATR",  "2"))
 ATR_LEN           = int(os.environ.get("ATR_LEN",         "14"))
 LOOKBACK_RETEST   = int(os.environ.get("LOOKBACK_RETEST", "40"))
 
