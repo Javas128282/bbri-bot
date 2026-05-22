@@ -176,7 +176,7 @@ def check_bias():
     time.sleep(2)
     df_xau    = fetch_data_twelvedata("XAU/USD", "1h", 60)   # XAUUSD langsung
     time.sleep(2)
-    df_tlt    = fetch_data_twelvedata("TLT",     "4h", 30)   # proxy US10Y
+    df_tlt = fetch_data_twelvedata("IEF", "4h", 60)   # ← 60 bar cukup untuk MA50   # proxy US10Y
 
     if df_eurusd is None or df_xau is None or df_tlt is None:
         log.warning("Satu atau lebih data bias gagal diambil, skip bias check.")
