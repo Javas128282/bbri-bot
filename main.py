@@ -1,6 +1,10 @@
 """
 BBR Bot — Base Break Retest + Market Bias | XAUUSD
-Notifikasi Telegram untuk sinyal BBR M5 dan arah market 1H/4H.
+Fitur:
+- Sinyal BBR (Break & Retest) setiap M5 candle close
+- Market Bias (DXY + US10Y + XAUUSD) setiap 1H
+- Ringkasan harian jam 07:00 WIB
+- Perintah /status dan /bias via Telegram
 """
 
 import os
@@ -9,7 +13,7 @@ import time
 import logging
 import requests
 import pandas as pd
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 # ═══════════════════════════════════════════════
 #  LOGGING
@@ -23,24 +27,24 @@ log = logging.getLogger(__name__)
 # ═══════════════════════════════════════════════
 #  CONFIG
 # ═══════════════════════════════════════════════
-TELEGRAM_TOKEN    = os.environ.get("TELEGRAM_TOKEN",    "ISI_TOKEN_BOT_KAMU")
-TELEGRAM_CHAT_ID  = os.environ.get("TELEGRAM_CHAT_ID",  "ISI_CHAT_ID_KAMU")
-TWELVE_DATA_KEY   = os.environ.get("TWELVE_DATA_KEY",   "ISI_API_KEY_KAMU")
+TELEGRAM_TOKEN   = os.environ.get("TELEGRAM_TOKEN",   "ISI_TOKEN_BOT_KAMU")
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "ISI_CHAT_ID_KAMU")
+TWELVE_DATA_KEY  = os.environ.get("TWELVE_DATA_KEY",  "ISI_API_KEY_KAMU")
 
-# BBR Parameters
-BASE_LEN          = int(os.environ.get("BASE_LEN",        "10"))
-BASE_MAX_ATR      = float(os.environ.get("BASE_MAX_ATR",  "2"))
-ATR_LEN           = int(os.environ.get("ATR_LEN",         "14"))
-LOOKBACK_RETEST   = int(os.environ.get("LOOKBACK_RETEST", "40"))
+BASE_LEN         = int(os.environ.get("BASE_LEN",        "10"))
+BASE_MAX_ATR     = float(os.environ.get("BASE_MAX_ATR",  "2"))
+ATR_LEN          = int(os.environ.get("ATR_LEN",         "14"))
+LOOKBACK_RETEST  = int(os.environ.get("LOOKBACK_RETEST", "40"))
+MA_FAST          = int(os.environ.get("MA_FAST",         "20"))
+MA_SLOW          = int(os.environ.get("MA_SLOW",         "50"))
 
-# Bias Parameters
-MA_FAST           = int(os.environ.get("MA_FAST", "20"))
-MA_SLOW           = int(os.environ.get("MA_SLOW", "50"))
+# Ringkasan harian jam 07:00 WIB = 00:00 UTC
+DAILY_SUMMARY_HOUR_UTC = int(os.environ.get("DAILY_SUMMARY_HOUR_UTC", "0"))
 
-STATE_FILE        = "bbr_state.json"
+STATE_FILE = "bbr_state.json"
 
 # ═══════════════════════════════════════════════
-#  TELEGRAM
+#  TELEGRAM — Kirim pesan
 # ═══════════════════════════════════════════════
 def send_telegram(message: str) -> bool:
     try:
@@ -60,6 +64,19 @@ def send_telegram(message: str) -> bool:
         return False
 
 # ═══════════════════════════════════════════════
+#  TELEGRAM — Ambil perintah masuk (/status, /bias)
+# ═══════════════════════════════════════════════
+def get_telegram_updates(offset: int = 0) -> list:
+    try:
+        url  = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates"
+        resp = requests.get(url, params={"offset": offset, "timeout": 2}, timeout=10)
+        if resp.status_code == 200:
+            return resp.json().get("result", [])
+    except Exception:
+        pass
+    return []
+
+# ═══════════════════════════════════════════════
 #  STATE
 # ═══════════════════════════════════════════════
 def load_state() -> dict:
@@ -70,16 +87,27 @@ def load_state() -> dict:
         except Exception:
             pass
     return {
-        # BBR state
+        # BBR
         "base_high":       None,
         "base_low":        None,
         "base_dir":        0,
         "break_bar_idx":   -1,
         "waiting":         False,
         "last_bar_time":   None,
-        # Bias state
+        # Bias
         "last_bias":       None,
-        "last_bias_hour":  None
+        "last_bias_hour":  None,
+        "trend_dxy":       None,
+        "trend_us10y":     None,
+        "trend_xau_1h":    None,
+        # Summary
+        "last_summary_day": None,
+        "daily_break_up":   0,
+        "daily_break_dn":   0,
+        "daily_retest_bull": 0,
+        "daily_retest_bear": 0,
+        # Telegram update offset
+        "tg_offset":        0
     }
 
 def save_state(state: dict):
@@ -90,40 +118,48 @@ def save_state(state: dict):
         log.error(f"Gagal simpan state: {e}")
 
 # ═══════════════════════════════════════════════
-#  FETCH DATA — Twelve Data
+#  FETCH DATA
 # ═══════════════════════════════════════════════
-def fetch_data_twelvedata(symbol: str, interval: str, outputsize: int = 100) -> pd.DataFrame | None:
-    try:
-        url    = "https://api.twelvedata.com/time_series"
-        params = {
-            "symbol":     symbol,
-            "interval":   interval,
-            "outputsize": outputsize,
-            "apikey":     TWELVE_DATA_KEY,
-            "format":     "JSON"
-        }
-        resp = requests.get(url, params=params, timeout=15)
-        data = resp.json()
+def fetch_data_twelvedata(symbol: str, interval: str,
+                           outputsize: int = 100, retries: int = 3) -> pd.DataFrame | None:
+    for attempt in range(1, retries + 1):
+        try:
+            resp = requests.get(
+                "https://api.twelvedata.com/time_series",
+                params={
+                    "symbol":     symbol,
+                    "interval":   interval,
+                    "outputsize": outputsize,
+                    "apikey":     TWELVE_DATA_KEY,
+                    "format":     "JSON"
+                },
+                timeout=15
+            )
+            data = resp.json()
 
-        if "values" not in data:
-            log.error(f"Twelve Data error [{symbol}]: {data.get('message', data)}")
-            return None
+            if "values" not in data:
+                log.error(f"[{symbol}] Error: {data.get('message', data)}")
+                return None
 
-        df = pd.DataFrame(data["values"])
-        df = df.rename(columns={
-            "datetime": "Datetime",
-            "open":  "Open", "high": "High",
-            "low":   "Low",  "close": "Close"
-        })
-        df["Datetime"] = pd.to_datetime(df["Datetime"])
-        df = df.set_index("Datetime").sort_index()
-        df = df[["Open", "High", "Low", "Close"]].astype(float)
-        df.dropna(inplace=True)
-        return df
+            df = pd.DataFrame(data["values"])
+            df = df.rename(columns={
+                "datetime": "Datetime",
+                "open": "Open", "high": "High",
+                "low":  "Low",  "close": "Close"
+            })
+            df["Datetime"] = pd.to_datetime(df["Datetime"])
+            df = df.set_index("Datetime").sort_index()
+            df = df[["Open", "High", "Low", "Close"]].astype(float)
+            df.dropna(inplace=True)
+            return df
 
-    except Exception as e:
-        log.error(f"Gagal fetch [{symbol}]: {e}")
-        return None
+        except Exception as e:
+            log.warning(f"[{symbol}] Attempt {attempt}/{retries} gagal: {e}")
+            if attempt < retries:
+                time.sleep(3 * attempt)
+
+    log.error(f"[{symbol}] Semua {retries} percobaan gagal")
+    return None
 
 # ═══════════════════════════════════════════════
 #  INDIKATOR
@@ -138,82 +174,67 @@ def calc_atr(df: pd.DataFrame, period: int) -> pd.Series:
     return tr.ewm(alpha=1 / period, adjust=False).mean()
 
 def get_trend(df: pd.DataFrame) -> str:
-    """Tentukan trend: bullish jika MA20 > MA50, bearish jika sebaliknya."""
     if len(df) < MA_SLOW + 2:
         return "unknown"
     close   = df["Close"]
     ma_fast = close.rolling(MA_FAST).mean()
     ma_slow = close.rolling(MA_SLOW).mean()
-    # Gunakan bar[-2] (bar yang sudah close)
     v_fast  = ma_fast.iloc[-2]
     v_slow  = ma_slow.iloc[-2]
     if pd.isna(v_fast) or pd.isna(v_slow):
         return "unknown"
     return "bullish" if v_fast > v_slow else "bearish"
 
-# ═══════════════════════════════════════════════
-#  MARKET BIAS CHECK
-#  Jalankan setiap 1H candle close
-# ═══════════════════════════════════════════════
 def invert_trend(trend: str) -> str:
-    """Balik arah trend untuk instrumen inverse proxy."""
     if trend == "bullish": return "bearish"
     if trend == "bearish": return "bullish"
     return "unknown"
 
-def check_bias():
-    """
-    Proxy yang digunakan:
-      DXY   → EUR/USD (inverse: EUR/USD bear = DXY bull)
-      US10Y → TLT ETF (inverse: TLT bear = yield naik = US10Y bull)
-      XAUUSD → XAU/USD langsung
-    """
+def trend_icon(trend: str) -> str:
+    return "📈" if trend == "bullish" else ("📉" if trend == "bearish" else "❓")
+
+# ═══════════════════════════════════════════════
+#  MARKET BIAS CHECK — setiap 1H
+# ═══════════════════════════════════════════════
+def check_bias(state: dict, force_notify: bool = False):
     log.info("── Mengecek Market Bias ──")
-    state = load_state()
 
-    # Fetch data dengan jeda antar request
-    df_eurusd = fetch_data_twelvedata("EUR/USD", "1h", 60)   # proxy DXY
+    # Proxy:
+    # DXY   → EUR/USD inverse (EUR/USD bear = DXY bull)
+    # US10Y → IEF inverse    (IEF bear = yield naik = US10Y bull)
+    # XAUUSD → langsung
+
+    df_eurusd = fetch_data_twelvedata("EUR/USD", "1h",  60)
     time.sleep(2)
-    df_xau    = fetch_data_twelvedata("XAU/USD", "1h", 60)   # XAUUSD langsung
+    df_xau    = fetch_data_twelvedata("XAU/USD", "1h",  60)
     time.sleep(2)
-    df_tlt = fetch_data_twelvedata("IEF", "4h", 60)   # ← 60 bar cukup untuk MA50   # proxy US10Y
+    df_ief    = fetch_data_twelvedata("IEF",     "4h",  60)
 
-    if df_eurusd is None or df_xau is None or df_tlt is None:
-        log.warning("Satu atau lebih data bias gagal diambil, skip bias check.")
-        return
+    if df_eurusd is None or df_xau is None or df_ief is None:
+        log.warning("Data bias tidak lengkap, skip.")
+        return state
 
-    # Tentukan trend — EUR/USD dan TLT dibalik karena inverse proxy
-    trend_dxy   = invert_trend(get_trend(df_eurusd))  # inverse EUR/USD
+    trend_dxy   = invert_trend(get_trend(df_eurusd))
     trend_xau   = get_trend(df_xau)
-    trend_us10y = invert_trend(get_trend(df_tlt))     # inverse TLT
+    trend_us10y = invert_trend(get_trend(df_ief))
 
-    log.info(f"DXY(1H via EURUSD⁻¹): {trend_dxy} | XAUUSD(1H): {trend_xau} | US10Y(4H via TLT⁻¹): {trend_us10y}")
+    log.info(f"DXY: {trend_dxy} | XAUUSD: {trend_xau} | US10Y: {trend_us10y}")
 
-    # ── Tentukan Bias ───────────────────────────
-    # SELL : DXY bullish + US10Y bullish + XAUUSD bearish
-    # BUY  : DXY bearish + US10Y bearish + XAUUSD bullish
-    # MIXED: sinyal tidak selaras
-    if (trend_dxy   == "bullish" and
-        trend_us10y == "bullish" and
-        trend_xau   == "bearish"):
+    if (trend_dxy == "bullish" and trend_us10y == "bullish" and trend_xau == "bearish"):
         new_bias = "SELL"
-
-    elif (trend_dxy   == "bearish" and
-          trend_us10y == "bearish" and
-          trend_xau   == "bullish"):
+    elif (trend_dxy == "bearish" and trend_us10y == "bearish" and trend_xau == "bullish"):
         new_bias = "BUY"
-
     else:
         new_bias = "MIXED"
 
     last_bias = state.get("last_bias")
 
-    # ── Kirim notif hanya jika bias BERUBAH ─────
-    if new_bias != last_bias:
-        dxy_icon   = "📈" if trend_dxy   == "bullish" else "📉"
-        xau_icon   = "📈" if trend_xau   == "bullish" else "📉"
-        us10y_icon = "📈" if trend_us10y == "bullish" else "📉"
+    # Simpan detail trend ke state untuk /status
+    state["trend_dxy"]    = trend_dxy
+    state["trend_us10y"]  = trend_us10y
+    state["trend_xau_1h"] = trend_xau
 
+    if new_bias != last_bias or force_notify:
         if new_bias == "SELL":
             header = "🔴 <b>BIAS BERUBAH: SELL</b>"
             footer = ("⚠️ <b>Kondisi SELL terpenuhi</b>\n"
@@ -229,37 +250,33 @@ def check_bias():
             footer = ("Sinyal <b>tidak selaras</b> antar market.\n"
                       "Hindari entry sampai ada konfirmasi penuh.")
 
-        now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+        now_str = datetime.now(timezone(timedelta(hours=7))).strftime("%d %b %Y %H:%M WIB")
 
-        msg = (
+        send_telegram(
             f"{header}\n\n"
-            f"{dxy_icon}  DXY (1H)         : <b>{trend_dxy.upper()}</b>  "
-            f"[via EUR/USD inverse]\n"
-            f"{us10y_icon}  US10Y yield (4H) : <b>{trend_us10y.upper()}</b>  "
-            f"[via TLT inverse]\n"
-            f"{xau_icon}  XAUUSD (1H)      : <b>{trend_xau.upper()}</b>  "
-            f"[MA{MA_FAST}/MA{MA_SLOW}]\n\n"
+            f"{trend_icon(trend_dxy)}  DXY (1H)    : <b>{trend_dxy.upper()}</b>  "
+            f"[MA{MA_FAST} {'>' if trend_dxy=='bullish' else '<'} MA{MA_SLOW}]\n"
+            f"{trend_icon(trend_us10y)}  US10Y (4H)  : <b>{trend_us10y.upper()}</b>  "
+            f"[MA{MA_FAST} {'>' if trend_us10y=='bullish' else '<'} MA{MA_SLOW}]\n"
+            f"{trend_icon(trend_xau)}  XAUUSD (1H) : <b>{trend_xau.upper()}</b>  "
+            f"[MA{MA_FAST} {'>' if trend_xau=='bullish' else '<'} MA{MA_SLOW}]\n\n"
             f"{footer}\n\n"
             f"🕐 {now_str}"
         )
-        send_telegram(msg)
         log.info(f"Bias: {last_bias} → {new_bias}")
-
         state["last_bias"] = new_bias
-        save_state(state)
-    else:
-        log.info(f"Bias tidak berubah: {new_bias}")
+
+    return state
 
 # ═══════════════════════════════════════════════
-#  BBR CHECK — Jalankan setiap M5 candle close
+#  BBR CHECK — setiap M5 candle close
 # ═══════════════════════════════════════════════
-def run_bbr_check():
+def run_bbr_check(state: dict) -> dict:
     log.info("── Menjalankan pengecekan BBR ──")
-    state = load_state()
 
     df = fetch_data_twelvedata("XAU/USD", "5min", 100)
     if df is None:
-        return
+        return state
 
     df["ATR"]             = calc_atr(df, ATR_LEN)
     df["HH"]              = df["High"].rolling(BASE_LEN).max()
@@ -269,7 +286,7 @@ def run_bbr_check():
     df.dropna(inplace=True)
 
     if len(df) < 3:
-        return
+        return state
 
     bar1      = df.iloc[-2]
     bar2      = df.iloc[-3]
@@ -278,7 +295,7 @@ def run_bbr_check():
 
     if state["last_bar_time"] == bar1_time:
         log.info(f"Bar {bar1_time} sudah diproses, skip.")
-        return
+        return state
 
     was_consolidating = bool(bar2["IsConsolidating"])
     hH2  = round(float(bar2["HH"]),  2)
@@ -287,12 +304,20 @@ def run_bbr_check():
 
     log.info(
         f"Bar: {bar1_time} | Close: {bar1['Close']:.2f} | "
-        f"wasConsolidating: {was_consolidating} | waiting: {state['waiting']}"
+        f"Consolidating: {was_consolidating} | Waiting: {state['waiting']}"
     )
 
     current_bias = state.get("last_bias", "MIXED")
+    now_wib = datetime.now(timezone(timedelta(hours=7))).strftime("%d %b %Y %H:%M WIB")
 
-    # ── BREAKOUT DETECTION ──────────────────────
+    def bias_note(expected: str) -> str:
+        if current_bias == expected:
+            return f"\n✅ Sesuai bias <b>{expected}</b>"
+        elif current_bias in ("BUY", "SELL"):
+            return f"\n⚠️ <i>Berlawanan dengan bias {current_bias}</i>"
+        return ""
+
+    # ── BREAKOUT ────────────────────────────────
     if was_consolidating and not state["waiting"]:
         close = round(float(bar1["Close"]), 2)
 
@@ -301,15 +326,14 @@ def run_bbr_check():
                 "base_high": hH2, "base_low": lL2,
                 "base_dir": 1, "break_bar_idx": bar1_idx, "waiting": True
             })
-            bias_note = "\n⚠️ Sesuai bias <b>BUY</b> ✅" if current_bias == "BUY" else \
-                        "\n⚠️ <i>Berlawanan dengan bias SELL</i>" if current_bias == "SELL" else ""
+            state["daily_break_up"] = state.get("daily_break_up", 0) + 1
             send_telegram(
                 "🟢 <b>BREAK UP | XAUUSD M5</b>\n"
                 f"Base High : <b>{hH2}</b>\n"
                 f"Base Low  : <b>{lL2}</b>\n"
                 f"ATR       : {atr1}"
-                f"{bias_note}\n"
-                f"🕐 {bar1_time}"
+                f"{bias_note('BUY')}\n"
+                f"🕐 {now_wib}"
             )
 
         elif close < lL2:
@@ -317,18 +341,17 @@ def run_bbr_check():
                 "base_high": hH2, "base_low": lL2,
                 "base_dir": -1, "break_bar_idx": bar1_idx, "waiting": True
             })
-            bias_note = "\n⚠️ Sesuai bias <b>SELL</b> ✅" if current_bias == "SELL" else \
-                        "\n⚠️ <i>Berlawanan dengan bias BUY</i>" if current_bias == "BUY" else ""
+            state["daily_break_dn"] = state.get("daily_break_dn", 0) + 1
             send_telegram(
                 "🔴 <b>BREAK DOWN | XAUUSD M5</b>\n"
                 f"Base High : <b>{hH2}</b>\n"
                 f"Base Low  : <b>{lL2}</b>\n"
                 f"ATR       : {atr1}"
-                f"{bias_note}\n"
-                f"🕐 {bar1_time}"
+                f"{bias_note('SELL')}\n"
+                f"🕐 {now_wib}"
             )
 
-    # ── RETEST DETECTION ────────────────────────
+    # ── RETEST ──────────────────────────────────
     elif state["waiting"] and state["break_bar_idx"] is not None:
         bars_since = bar1_idx - state["break_bar_idx"]
         base_high  = state["base_high"]
@@ -344,16 +367,15 @@ def run_bbr_check():
 
         elif base_dir == 1:
             if bar1_low <= base_high and bar1_low >= base_low:
-                bias_note = "\n⚠️ Sesuai bias <b>BUY</b> ✅" if current_bias == "BUY" else \
-                            "\n⚠️ <i>Berlawanan dengan bias SELL</i>" if current_bias == "SELL" else ""
+                state["daily_retest_bull"] = state.get("daily_retest_bull", 0) + 1
                 send_telegram(
                     "✅ <b>RETEST Bullish | XAUUSD M5</b>\n"
                     "Harga menyentuh zona Base dari atas\n"
                     f"Base High    : <b>{base_high}</b>\n"
                     f"Base Low     : <b>{base_low}</b>\n"
                     f"Low sekarang : <b>{bar1_low}</b>"
-                    f"{bias_note}\n"
-                    f"🕐 {bar1_time}"
+                    f"{bias_note('BUY')}\n"
+                    f"🕐 {now_wib}"
                 )
                 state["waiting"] = False
             elif bar1_close < base_low:
@@ -361,23 +383,131 @@ def run_bbr_check():
 
         elif base_dir == -1:
             if bar1_high >= base_low and bar1_high <= base_high:
-                bias_note = "\n⚠️ Sesuai bias <b>SELL</b> ✅" if current_bias == "SELL" else \
-                            "\n⚠️ <i>Berlawanan dengan bias BUY</i>" if current_bias == "BUY" else ""
+                state["daily_retest_bear"] = state.get("daily_retest_bear", 0) + 1
                 send_telegram(
                     "✅ <b>RETEST Bearish | XAUUSD M5</b>\n"
                     "Harga menyentuh zona Base dari bawah\n"
                     f"Base High     : <b>{base_high}</b>\n"
                     f"Base Low      : <b>{base_low}</b>\n"
                     f"High sekarang : <b>{bar1_high}</b>"
-                    f"{bias_note}\n"
-                    f"🕐 {bar1_time}"
+                    f"{bias_note('SELL')}\n"
+                    f"🕐 {now_wib}"
                 )
                 state["waiting"] = False
             elif bar1_close > base_high:
                 state["waiting"] = False
 
     state["last_bar_time"] = bar1_time
-    save_state(state)
+    return state
+
+# ═══════════════════════════════════════════════
+#  RINGKASAN HARIAN — jam 07:00 WIB
+# ═══════════════════════════════════════════════
+def send_daily_summary(state: dict) -> dict:
+    today_wib = datetime.now(timezone(timedelta(hours=7))).strftime("%d %b %Y")
+    last_day  = state.get("last_summary_day")
+
+    if last_day == today_wib:
+        return state
+
+    b_up    = state.get("daily_break_up",    0)
+    b_dn    = state.get("daily_break_dn",    0)
+    r_bull  = state.get("daily_retest_bull", 0)
+    r_bear  = state.get("daily_retest_bear", 0)
+    bias    = state.get("last_bias", "MIXED")
+
+    bias_icon = "🔴" if bias == "SELL" else ("🟢" if bias == "BUY" else "⚪")
+
+    send_telegram(
+        f"📋 <b>Ringkasan Harian — {today_wib}</b>\n\n"
+        f"Bias terakhir : {bias_icon} <b>{bias}</b>\n\n"
+        f"🟢 Break Up      : {b_up}x\n"
+        f"🔴 Break Down    : {b_dn}x\n"
+        f"✅ Retest Bullish: {r_bull}x\n"
+        f"✅ Retest Bearish: {r_bear}x\n"
+        f"📊 Total Sinyal  : {b_up + b_dn + r_bull + r_bear}x\n\n"
+        f"🕐 Update berikutnya: besok 07:00 WIB"
+    )
+    log.info("Ringkasan harian terkirim")
+
+    # Reset counter harian
+    state.update({
+        "last_summary_day":  today_wib,
+        "daily_break_up":    0,
+        "daily_break_dn":    0,
+        "daily_retest_bull": 0,
+        "daily_retest_bear": 0
+    })
+    return state
+
+# ═══════════════════════════════════════════════
+#  HANDLE PERINTAH TELEGRAM (/status, /bias)
+# ═══════════════════════════════════════════════
+def handle_commands(state: dict) -> dict:
+    offset   = state.get("tg_offset", 0)
+    updates  = get_telegram_updates(offset)
+
+    for update in updates:
+        update_id = update.get("update_id", 0)
+        state["tg_offset"] = update_id + 1
+
+        msg  = update.get("message", {})
+        text = msg.get("text", "").strip().lower()
+
+        if not text:
+            continue
+
+        log.info(f"Perintah masuk: {text}")
+
+        # ── /status ─────────────────────────────
+        if text.startswith("/status"):
+            bias       = state.get("last_bias",    "Belum diketahui")
+            trend_dxy  = state.get("trend_dxy",    "?")
+            trend_10y  = state.get("trend_us10y",  "?")
+            trend_xau  = state.get("trend_xau_1h", "?")
+            waiting    = state.get("waiting",      False)
+            b_high     = state.get("base_high",    "-")
+            b_low      = state.get("base_low",     "-")
+            b_dir_raw  = state.get("base_dir",     0)
+            b_dir      = "UP ⬆️" if b_dir_raw == 1 else ("DOWN ⬇️" if b_dir_raw == -1 else "-")
+            now_wib    = datetime.now(timezone(timedelta(hours=7))).strftime("%d %b %Y %H:%M WIB")
+
+            bias_icon  = "🔴" if bias == "SELL" else ("🟢" if bias == "BUY" else "⚪")
+
+            send_telegram(
+                f"📡 <b>Status Bot — {now_wib}</b>\n\n"
+                f"<b>Market Bias</b>\n"
+                f"{bias_icon} Bias saat ini : <b>{bias}</b>\n"
+                f"{trend_icon(trend_dxy)}  DXY (1H)     : {trend_dxy.upper()}\n"
+                f"{trend_icon(trend_10y)}  US10Y (4H)   : {trend_10y.upper()}\n"
+                f"{trend_icon(trend_xau)}  XAUUSD (1H)  : {trend_xau.upper()}\n\n"
+                f"<b>BBR State</b>\n"
+                f"Menunggu Retest : {'✅ Ya' if waiting else '❌ Tidak'}\n"
+                f"Arah Break      : {b_dir}\n"
+                f"Base High       : {b_high}\n"
+                f"Base Low        : {b_low}\n\n"
+                f"<b>Sinyal Hari Ini</b>\n"
+                f"🟢 Break Up       : {state.get('daily_break_up', 0)}x\n"
+                f"🔴 Break Down     : {state.get('daily_break_dn', 0)}x\n"
+                f"✅ Retest Bullish : {state.get('daily_retest_bull', 0)}x\n"
+                f"✅ Retest Bearish : {state.get('daily_retest_bear', 0)}x"
+            )
+
+        # ── /bias ────────────────────────────────
+        elif text.startswith("/bias"):
+            send_telegram("🔄 Mengecek bias market, tunggu sebentar...")
+            state = check_bias(state, force_notify=True)
+
+        # ── /help ────────────────────────────────
+        elif text.startswith("/help"):
+            send_telegram(
+                "🤖 <b>BBR Bot — Daftar Perintah</b>\n\n"
+                "/status — Lihat kondisi bias dan BBR saat ini\n"
+                "/bias   — Paksa cek dan tampilkan bias sekarang\n"
+                "/help   — Tampilkan pesan ini"
+            )
+
+    return state
 
 # ═══════════════════════════════════════════════
 #  SCHEDULER HELPERS
@@ -388,16 +518,18 @@ def seconds_to_next_candle(candle_seconds: int = 300) -> float:
     return candle_seconds - elapsed + 10
 
 def current_hour_key() -> str:
-    """String unik per jam UTC, contoh: '2026-05-21-14'"""
-    now = datetime.now(timezone.utc)
-    return now.strftime("%Y-%m-%d-%H")
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d-%H")
+
+def is_daily_summary_time() -> bool:
+    now_utc = datetime.now(timezone.utc)
+    return now_utc.hour == DAILY_SUMMARY_HOUR_UTC and now_utc.minute < 10
 
 # ═══════════════════════════════════════════════
 #  ENTRY POINT
 # ═══════════════════════════════════════════════
 if __name__ == "__main__":
     log.info("═══════════════════════════════════════")
-    log.info("  BBR Bot — XAUUSD M5 + Bias — Start")
+    log.info("  BBR Bot — XAUUSD M5 + Bias — Start  ")
     log.info("═══════════════════════════════════════")
 
     send_telegram(
@@ -408,26 +540,42 @@ if __name__ == "__main__":
         f"⚙️ MA Fast/Slow   : MA{MA_FAST} / MA{MA_SLOW}\n\n"
         "📊 <b>Bias Rule:</b>\n"
         "🟢 BUY  = DXY↓ + US10Y↓ + XAUUSD↑\n"
-        "🔴 SELL = DXY↑ + US10Y↑ + XAUUSD↓"
+        "🔴 SELL = DXY↑ + US10Y↑ + XAUUSD↓\n\n"
+        "📋 Ringkasan harian: setiap 07:00 WIB\n"
+        "💬 Ketik /help untuk daftar perintah"
     )
 
+    state = load_state()
+
     # Jalankan sekali saat start
-    run_bbr_check()
-    check_bias()
+    state = run_bbr_check(state)
+    state = check_bias(state)
+    save_state(state)
 
     last_bias_hour = current_hour_key()
 
     # ── Main Loop ───────────────────────────────
     while True:
+        # Cek perintah Telegram masuk
+        state = handle_commands(state)
+        save_state(state)
+
+        # Tunggu sampai M5 candle berikutnya
         wait = seconds_to_next_candle(300)
         log.info(f"Menunggu {wait:.0f} detik sampai candle berikutnya...")
         time.sleep(wait)
 
         # BBR check setiap M5
-        run_bbr_check()
+        state = run_bbr_check(state)
 
         # Bias check setiap 1H
         this_hour = current_hour_key()
         if this_hour != last_bias_hour:
-            check_bias()
+            state = check_bias(state)
             last_bias_hour = this_hour
+
+        # Ringkasan harian jam 07:00 WIB
+        if is_daily_summary_time():
+            state = send_daily_summary(state)
+
+        save_state(state)
