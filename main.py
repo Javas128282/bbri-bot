@@ -3,6 +3,8 @@ RNM Fade Bot — Round-Number Magnet Fade (RSI-2) | XAUUSD
 Fitur:
 - Sinyal fade di level kelipatan $10 dengan RSI(2) jenuh + candle rejection (M5)
 - Trend wajib dari MA20 & MA50 di H1, alert tiap kali trend H1 berubah
+- Sideways = harga di antara MA20 & MA50 / menyentuh-dekat salah satu MA
+- Heads-up alert saat harga mendekati level $10 yang searah trend (sebelum entry signal)
 - Filter ATR(14) M5 (skip kalau market terlalu volatile)
 - Filter momentum H1 (skip kalau candle H1 terakhir breakout kuat searah level)
 - Filter sesi London/NY + blackout manual sekitar news besar
@@ -59,6 +61,14 @@ RR                 = float(os.environ.get("RR", "2.0"))
 
 # Anti-spam: jangan kirim sinyal sama berulang di bar2 berurutan
 COOLDOWN_BARS       = int(os.environ.get("COOLDOWN_BARS", "6"))
+
+# Sideways H1: harga dianggap "menyentuh/dekat MA" atau "di antara MA20 & MA50"
+# kalau jaraknya ke salah satu MA <= buffer ini (dalam USD)
+H1_TREND_BUFFER     = float(os.environ.get("H1_TREND_BUFFER", "2.0"))
+
+# Heads-up: alert kalau harga mendekati level $10 yang searah trend (sebelum RSI/rejection muncul)
+NEAR_LEVEL_USD            = float(os.environ.get("NEAR_LEVEL_USD", "3.0"))
+NEAR_LEVEL_COOLDOWN_BARS  = int(os.environ.get("NEAR_LEVEL_COOLDOWN_BARS", "6"))
 
 # Sesi aktif (UTC). Default kira-kira menutupi London + NY.
 SESSION_START_UTC  = int(os.environ.get("SESSION_START_UTC", "7"))
@@ -124,6 +134,8 @@ def load_state() -> dict:
         "bar_counter":     0,
         "last_alert_key":  None,
         "last_alert_bar":  -999,
+        "last_near_alert_key": None,
+        "last_near_alert_bar": -999,
         # snapshot terakhir untuk /status & /trend
         "last_close":      None,
         "last_atr":        None,
@@ -140,6 +152,7 @@ def load_state() -> dict:
         "daily_skip_atr":        0,
         "daily_skip_momentum":   0,
         "daily_skip_session":    0,
+        "daily_near_alert":      0,
         "last_summary_day":      None,
         # telegram offset
         "tg_offset":            0
@@ -302,9 +315,11 @@ def check_h1_trend(state: dict, force_notify: bool = False) -> dict:
     ma_fast = round(float(bar1["MA_fast"]), 2)
     ma_slow = round(float(bar1["MA_slow"]), 2)
 
-    if close > ma_fast and close > ma_slow:
+    # Sideways = harga di antara MA20 & MA50, ATAU harga menyentuh/dekat salah satu MA
+    # (jarak ke MA <= H1_TREND_BUFFER) — selama itu tidak dianggap bullish/bearish penuh.
+    if close > ma_fast + H1_TREND_BUFFER and close > ma_slow + H1_TREND_BUFFER:
         trend = "bullish"
-    elif close < ma_fast and close < ma_slow:
+    elif close < ma_fast - H1_TREND_BUFFER and close < ma_slow - H1_TREND_BUFFER:
         trend = "bearish"
     else:
         trend = "sideways"
@@ -333,6 +348,55 @@ def check_h1_trend(state: dict, force_notify: bool = False) -> dict:
     return state
 
 # ═══════════════════════════════════════════════
+#  HEADS-UP: harga mendekati level $10 yang SEARAH trend H1
+#  (alert lebih dini, sebelum RSI(2) ekstrem & rejection muncul)
+# ═══════════════════════════════════════════════
+def check_near_level_heads_up(state: dict, trend: str, close: float,
+                               levels: list, bar_idx: int) -> dict:
+    if trend not in ("bullish", "bearish"):
+        return state  # sideways tidak punya arah buat dicocokkan
+
+    if trend == "bullish":
+        candidates = [l for l in levels if l > close]
+        if not candidates:
+            return state
+        nearest  = min(candidates)
+        distance = round(nearest - close, 2)
+    else:
+        candidates = [l for l in levels if l < close]
+        if not candidates:
+            return state
+        nearest  = max(candidates)
+        distance = round(close - nearest, 2)
+
+    if distance > NEAR_LEVEL_USD:
+        return state
+
+    key = f"NEAR_{trend}_{nearest}"
+    if state.get("last_near_alert_key") == key and \
+       (bar_idx - state.get("last_near_alert_bar", -999)) < NEAR_LEVEL_COOLDOWN_BARS:
+        return state
+
+    if not is_active_session() or is_news_blackout():
+        return state
+
+    now_wib = datetime.now(timezone(timedelta(hours=7))).strftime("%d %b %Y %H:%M WIB")
+    send_telegram(
+        "📍 <b>Harga Mendekati Level $10 (searah trend)</b>\n\n"
+        f"Trend H1 : {trend_icon(trend)} {trend}\n"
+        f"Level    : <b>{nearest}</b>\n"
+        f"Close    : <b>{close}</b>\n"
+        f"Jarak    : {distance} (≤ {NEAR_LEVEL_USD})\n\n"
+        f"👀 Pantau RSI(2) M5 & candle rejection di level ini untuk entry fade.\n\n"
+        f"🕐 {now_wib}"
+    )
+
+    state["last_near_alert_key"] = key
+    state["last_near_alert_bar"] = bar_idx
+    state["daily_near_alert"]    = state.get("daily_near_alert", 0) + 1
+    return state
+
+# ═══════════════════════════════════════════════
 #  RNM FADE CHECK — setiap M5 candle close
 # ═══════════════════════════════════════════════
 def run_rnm_check(state: dict) -> dict:
@@ -342,8 +406,10 @@ def run_rnm_check(state: dict) -> dict:
     if df is None:
         return state
 
-    df["ATR"]  = calc_atr(df, ATR_LEN)
-    df["RSI2"] = calc_rsi(df["Close"], RSI_PERIOD)
+    df["ATR"]       = calc_atr(df, ATR_LEN)
+    df["RSI2"]      = calc_rsi(df["Close"], RSI_PERIOD)   # RSI umum (buat /status & /trend)
+    df["RSI2_high"] = calc_rsi(df["High"],  RSI_PERIOD)   # jenuh-beli tepat saat wick atas
+    df["RSI2_low"]  = calc_rsi(df["Low"],   RSI_PERIOD)   # jenuh-jual tepat saat wick bawah
     df.dropna(inplace=True)
 
     if len(df) < 3:
@@ -359,11 +425,13 @@ def run_rnm_check(state: dict) -> dict:
     state["bar_counter"] = state.get("bar_counter", 0) + 1
     bar_idx = state["bar_counter"]
 
-    close = round(float(bar1["Close"]), 2)
-    high  = round(float(bar1["High"]),  2)
-    low   = round(float(bar1["Low"]),   2)
-    atr   = round(float(bar1["ATR"]),   2)
-    rsi   = round(float(bar1["RSI2"]),  1)
+    close    = round(float(bar1["Close"]),     2)
+    high     = round(float(bar1["High"]),      2)
+    low      = round(float(bar1["Low"]),       2)
+    atr      = round(float(bar1["ATR"]),       2)
+    rsi      = round(float(bar1["RSI2"]),      1)
+    rsi_high = round(float(bar1["RSI2_high"]), 1)
+    rsi_low  = round(float(bar1["RSI2_low"]),  1)
 
     # Trend wajib dari MA20 & MA50 di H1 (di-update terpisah oleh check_h1_trend)
     trend = state.get("h1_trend", "unknown")
@@ -380,6 +448,9 @@ def run_rnm_check(state: dict) -> dict:
 
     log.info(f"Bar: {bar1_time} | Close: {close} | ATR: {atr} | RSI2: {rsi} | Trend H1: {trend}")
 
+    # ── Heads-up: harga mendekati level $10 searah trend (independen dari filter ATR) ──
+    state = check_near_level_heads_up(state, trend, close, levels, bar_idx)
+
     # ── Filter 1: ATR terlalu tinggi → market terlalu volatile untuk fade ──
     if atr > ATR_MAX:
         log.info(f"Skip: ATR({atr}) > ATR_MAX({ATR_MAX})")
@@ -393,12 +464,12 @@ def run_rnm_check(state: dict) -> dict:
     min_margin = atr * REJECTION_MIN_ATR_FRACTION
 
     for lvl in levels:
-        # Rejection dari atas → potensi SELL (RSI jenuh beli)
-        if high >= lvl and close < lvl and (lvl - close) >= min_margin and rsi >= RSI_OVERBOUGHT:
+        # Rejection dari atas → potensi SELL (RSI High jenuh-beli persis saat wick menyentuh level)
+        if high >= lvl and close < lvl and (lvl - close) >= min_margin and rsi_high >= RSI_OVERBOUGHT:
             direction, level_hit = "SELL", lvl
             break
-        # Rejection dari bawah → potensi BUY (RSI jenuh jual)
-        if low <= lvl and close > lvl and (close - lvl) >= min_margin and rsi <= RSI_OVERSOLD:
+        # Rejection dari bawah → potensi BUY (RSI Low jenuh-jual persis saat wick menyentuh level)
+        if low <= lvl and close > lvl and (close - lvl) >= min_margin and rsi_low <= RSI_OVERSOLD:
             direction, level_hit = "BUY", lvl
             break
 
@@ -443,13 +514,13 @@ def run_rnm_check(state: dict) -> dict:
         tp = round(entry - tp_dist, 2)
         state["daily_sell"] = state.get("daily_sell", 0) + 1
         header = "🔴 <b>SELL — Round-Number Magnet Fade</b>"
-        rsi_note = "RSI(2) jenuh beli"
+        rsi_label = f"RSI(2) High : {rsi_high} (jenuh beli saat wick)"
     else:
         sl = round(entry - sl_dist, 2)
         tp = round(entry + tp_dist, 2)
         state["daily_buy"] = state.get("daily_buy", 0) + 1
         header = "🟢 <b>BUY — Round-Number Magnet Fade</b>"
-        rsi_note = "RSI(2) jenuh jual"
+        rsi_label = f"RSI(2) Low  : {rsi_low} (jenuh jual saat wick)"
 
     now_wib = datetime.now(timezone(timedelta(hours=7))).strftime("%d %b %Y %H:%M WIB")
 
@@ -459,7 +530,7 @@ def run_rnm_check(state: dict) -> dict:
         f"Entry        : <b>{entry}</b>\n"
         f"SL           : <b>{sl}</b>\n"
         f"TP (RR 1:{RR:g}) : <b>{tp}</b>\n\n"
-        f"RSI(2)  : {rsi} ({rsi_note})\n"
+        f"{rsi_label}\n"
         f"ATR(14) : {atr}\n"
         f"Trend H1: {trend_icon(trend)} {trend}\n\n"
         f"🕐 {now_wib}"
@@ -482,6 +553,7 @@ def send_daily_summary(state: dict) -> dict:
 
     buy        = state.get("daily_buy",          0)
     sell       = state.get("daily_sell",         0)
+    near       = state.get("daily_near_alert",   0)
     skip_atr   = state.get("daily_skip_atr",     0)
     skip_mom   = state.get("daily_skip_momentum",0)
     skip_sess  = state.get("daily_skip_session", 0)
@@ -490,6 +562,7 @@ def send_daily_summary(state: dict) -> dict:
         f"📋 <b>Ringkasan Harian — {today_wib}</b>\n\n"
         f"🟢 Sinyal BUY  : {buy}x\n"
         f"🔴 Sinyal SELL : {sell}x\n"
+        f"📍 Heads-up dekat level : {near}x\n"
         f"📊 Total Sinyal: {buy + sell}x\n\n"
         f"⏭️ Skip (ATR > {ATR_MAX})      : {skip_atr}x\n"
         f"⏭️ Skip (momentum H1)     : {skip_mom}x\n"
@@ -502,6 +575,7 @@ def send_daily_summary(state: dict) -> dict:
         "last_summary_day":    today_wib,
         "daily_buy":           0,
         "daily_sell":          0,
+        "daily_near_alert":    0,
         "daily_skip_atr":      0,
         "daily_skip_momentum": 0,
         "daily_skip_session":  0,
@@ -539,6 +613,7 @@ def handle_commands(state: dict) -> dict:
                 f"<b>Sinyal Hari Ini</b>\n"
                 f"🟢 BUY  : {state.get('daily_buy', 0)}x\n"
                 f"🔴 SELL : {state.get('daily_sell', 0)}x\n"
+                f"📍 Heads-up dekat level : {state.get('daily_near_alert', 0)}x\n"
                 f"⏭️ Skip ATR/Momentum/Sesi : "
                 f"{state.get('daily_skip_atr',0)}/{state.get('daily_skip_momentum',0)}/{state.get('daily_skip_session',0)}"
             )
