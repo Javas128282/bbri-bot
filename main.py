@@ -682,8 +682,6 @@ if __name__ == "__main__":
     state = run_rnm_check(state)
     save_state(state)
 
-    last_h1_hour = current_hour_key()
-
     # ── Main Loop ───────────────────────────────
     while True:
         state = handle_commands(state)
@@ -693,11 +691,9 @@ if __name__ == "__main__":
         log.info(f"Menunggu {wait:.0f} detik sampai candle berikutnya...")
         time.sleep(wait)
 
-        # Cek pergantian trend H1 (sekali per jam, sebelum cek sinyal M5)
-        this_hour = current_hour_key()
-        if this_hour != last_h1_hour:
-            state = check_h1_trend(state)
-            last_h1_hour = this_hour
+        # Cek trend H1 setiap M5 (bukan cuma sekali per jam) — begitu candle H1
+        # baru saja close, pergantian trend langsung kedeteksi maksimal dalam 5 menit.
+        state = check_h1_trend(state)
 
         state = run_rnm_check(state)
 
