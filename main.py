@@ -1,15 +1,13 @@
 """
-RNM Fade Bot — Round-Number Magnet Fade (RSI-2) | XAUUSD
-Fitur:
-- Sinyal fade di level kelipatan $10 dengan RSI(2) jenuh + candle rejection (M5)
-- Trend wajib dari MA20 & MA50 di H1, alert tiap kali trend H1 berubah
-- Sideways = harga di antara MA20 & MA50 / menyentuh-dekat salah satu MA
-- Heads-up alert saat harga mendekati level $10 yang searah trend (sebelum entry signal)
-- Filter ATR(14) M5 (skip kalau market terlalu volatile)
-- Filter momentum H1 (skip kalau candle H1 terakhir breakout kuat searah level)
-- Filter sesi London/NY + blackout manual sekitar news besar
-- Ringkasan harian jam 07:00 WIB
-- Perintah /status, /trend, /help via Telegram
+RNM Fade Bot v2 — Round-Number Magnet Fade | XAUUSD
+Strategi tervalidasi: IS 2010-2019 | OOS 2020-2026
+- WR 62.4% | PF 1.72 | Calmar 13.30 | Sharpe 1.557
+- EMA50 H1 + slope → bias long/short/neutral (skip neutral)
+- ATR H1 < $11 (bukan ATR M5)
+- RSI(2) ≥ 90 / ≤ 10 di candle M5 close
+- SL = ujung wick + $1.5
+- TP1 = 0.5×ATR H1, TP2 = 1.0×ATR H1 (partial 50/50)
+- Time stop: 20 menit jika belum TP1
 """
 
 import os
@@ -28,6 +26,612 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s"
 )
+log = logging.getLogger(__name__)
+
+# ═══════════════════════════════════════════════
+#  CONFIG — semua via environment variable
+# ═══════════════════════════════════════════════
+TELEGRAM_TOKEN   = os.environ.get("TELEGRAM_TOKEN",   "ISI_TOKEN_BOT_KAMU")
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "ISI_CHAT_ID_KAMU")
+TWELVE_DATA_KEY  = os.environ.get("TWELVE_DATA_KEY",  "ISI_API_KEY_KAMU")
+
+# RSI
+RSI_PERIOD   = int(os.environ.get("RSI_PERIOD",   "2"))
+RSI_OB       = float(os.environ.get("RSI_OB",     "90"))   # overbought → SELL
+RSI_OS       = float(os.environ.get("RSI_OS",     "10"))   # oversold  → BUY
+
+# EMA50 H1 (bias filter)
+EMA_PERIOD   = int(os.environ.get("EMA_PERIOD",   "50"))
+EMA_SLOPE_BARS = int(os.environ.get("EMA_SLOPE_BARS", "5"))  # lookback slope
+EMA_BAND_PCT = float(os.environ.get("EMA_BAND_PCT", "0.001")) # 0.1% neutral band
+
+# ATR H1 (volatility gate — BUKAN ATR M5)
+ATR_PERIOD   = int(os.environ.get("ATR_PERIOD",   "14"))
+ATR_MAX_H1   = float(os.environ.get("ATR_MAX_H1", "11.0"))  # skip jika ATR H1 >= $11
+
+# Level $10
+LEVEL_STEP   = float(os.environ.get("LEVEL_STEP",  "10"))
+LEVEL_RANGE  = int(os.environ.get("LEVEL_RANGE",   "4"))    # garis di atas & bawah
+
+# SL / TP (berbasis ATR H1)
+SL_BUFFER    = float(os.environ.get("SL_BUFFER",   "1.5"))  # wick + buffer
+TP1_ATR_MULT = float(os.environ.get("TP1_ATR_MULT","0.5"))  # TP1 = 0.5 × ATR H1
+TP2_ATR_MULT = float(os.environ.get("TP2_ATR_MULT","1.0"))  # TP2 = 1.0 × ATR H1
+TIME_STOP_MIN= int(os.environ.get("TIME_STOP_MIN", "20"))   # menit, info saja
+
+# Wick minimum: wick harus keluar dari level minimal sebesar ini
+WICK_MIN     = float(os.environ.get("WICK_MIN",    "0.30"))
+
+# Anti-spam cooldown
+COOLDOWN_BARS = int(os.environ.get("COOLDOWN_BARS","6"))
+
+# Big H1 candle filter (anti breakout asli)
+BIG_CANDLE_MULT = float(os.environ.get("BIG_CANDLE_MULT", "2.5"))
+BIG_CANDLE_LOOK = int(os.environ.get("BIG_CANDLE_LOOK",   "20"))
+
+# Sesi aktif UTC
+SESSION_START = int(os.environ.get("SESSION_START", "7"))
+SESSION_END   = int(os.environ.get("SESSION_END",   "21"))
+
+# News blackout manual (jam UTC dipisah koma, misal "13:30,20:00")
+NEWS_TIMES_UTC  = os.environ.get("NEWS_TIMES_UTC", "")
+NEWS_BUFFER_MIN = int(os.environ.get("NEWS_BUFFER_MIN", "30"))
+
+# Ringkasan harian jam 07:00 WIB = 00:00 UTC
+DAILY_SUMMARY_HOUR_UTC = int(os.environ.get("DAILY_SUMMARY_HOUR_UTC", "0"))
+
+STATE_FILE = "rnm_state_v2.json"
+
+# ═══════════════════════════════════════════════
+#  TELEGRAM
+# ═══════════════════════════════════════════════
+def send_telegram(message: str) -> bool:
+    try:
+        url  = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+        resp = requests.post(
+            url,
+            json={"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "HTML"},
+            timeout=10
+        )
+        if resp.status_code == 200:
+            log.info(f"✅ TG sent: {message[:60].strip()}")
+            return True
+        log.error(f"❌ TG {resp.status_code}: {resp.text}")
+        return False
+    except Exception as e:
+        log.error(f"❌ TG exception: {e}")
+        return False
+
+def get_updates(offset: int = 0) -> list:
+    try:
+        url  = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates"
+        resp = requests.get(url, params={"offset": offset, "timeout": 2}, timeout=10)
+        if resp.status_code == 200:
+            return resp.json().get("result", [])
+    except Exception:
+        pass
+    return []
+
+# ═══════════════════════════════════════════════
+#  STATE
+# ═══════════════════════════════════════════════
+def load_state() -> dict:
+    if os.path.exists(STATE_FILE):
+        try:
+            with open(STATE_FILE) as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {
+        "last_bar_time":        None,
+        "bar_counter":          0,
+        "last_alert_key":       None,
+        "last_alert_bar":       -999,
+        # Snapshot H1
+        "h1_bias":              None,
+        "h1_close":             None,
+        "h1_ema50":             None,
+        "h1_atr":               None,
+        # Snapshot M5
+        "last_close":           None,
+        "last_rsi2":            None,
+        "last_levels":          [],
+        # Counter harian
+        "daily_buy":            0,
+        "daily_sell":           0,
+        "daily_skip_atr":       0,
+        "daily_skip_bias":      0,
+        "daily_skip_session":   0,
+        "daily_skip_bigcandle": 0,
+        "last_summary_day":     None,
+        # Telegram offset
+        "tg_offset":            0,
+    }
+
+def save_state(state: dict):
+    try:
+        with open(STATE_FILE, "w") as f:
+            json.dump(state, f, indent=2)
+    except Exception as e:
+        log.error(f"Gagal simpan state: {e}")
+
+# ═══════════════════════════════════════════════
+#  FETCH DATA
+# ═══════════════════════════════════════════════
+def fetch(symbol: str, interval: str, size: int = 120, retries: int = 3) -> pd.DataFrame | None:
+    for attempt in range(1, retries + 1):
+        try:
+            resp = requests.get(
+                "https://api.twelvedata.com/time_series",
+                params={"symbol": symbol, "interval": interval,
+                        "outputsize": size, "apikey": TWELVE_DATA_KEY, "format": "JSON"},
+                timeout=15
+            )
+            data = resp.json()
+            if "values" not in data:
+                log.error(f"[{symbol}/{interval}] {data.get('message', data)}")
+                return None
+            df = pd.DataFrame(data["values"])
+            df = df.rename(columns={"datetime":"Datetime","open":"Open",
+                                     "high":"High","low":"Low","close":"Close"})
+            df["Datetime"] = pd.to_datetime(df["Datetime"])
+            df = df.set_index("Datetime").sort_index()
+            df = df[["Open","High","Low","Close"]].astype(float)
+            df.dropna(inplace=True)
+            return df
+        except Exception as e:
+            log.warning(f"[{symbol}/{interval}] attempt {attempt}: {e}")
+            if attempt < retries:
+                time.sleep(3 * attempt)
+    return None
+
+# ═══════════════════════════════════════════════
+#  INDIKATOR
+# ═══════════════════════════════════════════════
+def calc_ema(series: pd.Series, period: int) -> pd.Series:
+    return series.ewm(span=period, adjust=False).mean()
+
+def calc_atr(df: pd.DataFrame, period: int) -> pd.Series:
+    h, l, c = df["High"], df["Low"], df["Close"]
+    tr = pd.concat([h-l, (h-c.shift()).abs(), (l-c.shift()).abs()], axis=1).max(axis=1)
+    return tr.ewm(alpha=1/period, adjust=False).mean()
+
+def calc_rsi(series: pd.Series, period: int) -> pd.Series:
+    d = series.diff()
+    g = d.clip(lower=0).ewm(alpha=1/period, adjust=False).mean()
+    l = (-d).clip(lower=0).ewm(alpha=1/period, adjust=False).mean()
+    return 100 - 100/(1 + g/l.replace(0, 1e-10))
+
+def bias_icon(bias: str) -> str:
+    return {"long":"📈", "short":"📉", "neutral":"↔️"}.get(bias, "❓")
+
+def find_levels(price: float) -> list:
+    base = math.floor(price / LEVEL_STEP) * LEVEL_STEP
+    return sorted(round(base + i*LEVEL_STEP, 2) for i in range(-LEVEL_RANGE, LEVEL_RANGE+1))
+
+# ═══════════════════════════════════════════════
+#  H1 DATA — bias + ATR + big candle check
+# ═══════════════════════════════════════════════
+def get_h1_data(state: dict) -> dict | None:
+    """
+    Ambil H1, hitung:
+    - EMA50 + slope → bias (long / short / neutral)
+    - ATR(14) H1 → gate volatilitas
+    - Big candle flag → anti breakout asli
+    Return dict atau None kalau data tidak cukup.
+    """
+    need = EMA_PERIOD + EMA_SLOPE_BARS + 5
+    df = fetch("XAU/USD", "1h", max(need, 80))
+    if df is None or len(df) < need:
+        log.warning("H1 data tidak cukup")
+        return None
+
+    df["EMA50"] = calc_ema(df["Close"], EMA_PERIOD)
+    df["ATR14"] = calc_atr(df, ATR_PERIOD)
+    df["Body"]  = (df["Close"] - df["Open"]).abs()
+    df["AvgBody"] = df["Body"].rolling(BIG_CANDLE_LOOK, min_periods=5).mean()
+    df.dropna(inplace=True)
+
+    if len(df) < EMA_SLOPE_BARS + 2:
+        return None
+
+    # Gunakan candle H1 terakhir yang sudah CLOSE (iloc[-2])
+    last  = df.iloc[-2]
+    prev  = df.iloc[-(EMA_SLOPE_BARS+2)]   # untuk slope
+
+    close  = float(last["Close"])
+    ema50  = float(last["EMA50"])
+    atr14  = float(last["ATR14"])
+    slope  = float(last["EMA50"]) - float(prev["EMA50"])
+    band   = ema50 * EMA_BAND_PCT
+
+    # Bias
+    if close > ema50 + band and slope > 0:
+        bias = "long"
+    elif close < ema50 - band and slope < 0:
+        bias = "short"
+    else:
+        bias = "neutral"
+
+    # Big candle flag (untuk filter anti-breakout)
+    big_bull = (last["Body"] > last["AvgBody"] * BIG_CANDLE_MULT) and (last["Close"] > last["Open"])
+    big_bear = (last["Body"] > last["AvgBody"] * BIG_CANDLE_MULT) and (last["Close"] < last["Open"])
+
+    return {
+        "close":    round(close, 2),
+        "ema50":    round(ema50, 2),
+        "atr14":    round(atr14, 2),
+        "slope":    round(slope, 4),
+        "bias":     bias,
+        "big_bull": big_bull,
+        "big_bear": big_bear,
+    }
+
+# ═══════════════════════════════════════════════
+#  FILTER HELPERS
+# ═══════════════════════════════════════════════
+def is_active_session() -> bool:
+    h = datetime.now(timezone.utc).hour
+    return SESSION_START <= h < SESSION_END
+
+def is_news_blackout() -> bool:
+    if not NEWS_TIMES_UTC.strip():
+        return False
+    now = datetime.now(timezone.utc)
+    for t in NEWS_TIMES_UTC.split(","):
+        t = t.strip()
+        if not t:
+            continue
+        try:
+            hh, mm = map(int, t.split(":"))
+            nt   = now.replace(hour=hh, minute=mm, second=0, microsecond=0)
+            diff = abs((now - nt).total_seconds()) / 60
+            if diff <= NEWS_BUFFER_MIN:
+                return True
+        except Exception:
+            continue
+    return False
+
+# ═══════════════════════════════════════════════
+#  MAIN SIGNAL CHECK (dipanggil setiap candle M5)
+# ═══════════════════════════════════════════════
+def run_check(state: dict) -> dict:
+    log.info("── M5 check ──")
+
+    # 1. Ambil H1 data
+    h1 = get_h1_data(state)
+    if h1 is None:
+        return state
+
+    bias   = h1["bias"]
+    h1_atr = h1["atr14"]
+
+    # Update snapshot H1
+    old_bias = state.get("h1_bias")
+    state.update({"h1_bias": bias, "h1_close": h1["close"],
+                  "h1_ema50": h1["ema50"], "h1_atr": h1_atr})
+
+    # Notifikasi kalau bias H1 berubah
+    if old_bias and old_bias != bias:
+        now_wib = _wib_now()
+        send_telegram(
+            f"🔄 <b>Bias H1 Berubah</b>\n\n"
+            f"{bias_icon(old_bias)} {old_bias.upper()}  →  {bias_icon(bias)} <b>{bias.upper()}</b>\n\n"
+            f"Close H1 : {h1['close']}\n"
+            f"EMA50    : {h1['ema50']}\n"
+            f"Slope    : {h1['slope']:+.2f}\n"
+            f"ATR H1   : {h1_atr}\n\n"
+            f"🕐 {now_wib}"
+        )
+
+    # 2. Filter ATR H1
+    if h1_atr >= ATR_MAX_H1:
+        log.info(f"Skip: ATR H1 {h1_atr} ≥ {ATR_MAX_H1}")
+        state["daily_skip_atr"] = state.get("daily_skip_atr", 0) + 1
+        return state
+
+    # 3. Filter bias neutral — skip semua sinyal
+    if bias == "neutral":
+        log.info("Skip: bias H1 neutral")
+        state["daily_skip_bias"] = state.get("daily_skip_bias", 0) + 1
+        return state
+
+    # 4. Ambil M5 data
+    df = fetch("XAU/USD", "5min", 120)
+    if df is None or len(df) < 10:
+        return state
+
+    df["RSI2"] = calc_rsi(df["Close"], RSI_PERIOD)
+    df.dropna(inplace=True)
+
+    bar      = df.iloc[-2]       # candle M5 terakhir yang sudah CLOSE
+    bar_time = str(df.index[-2])
+
+    if state["last_bar_time"] == bar_time:
+        log.info(f"Bar {bar_time} sudah diproses, skip")
+        return state
+
+    state["bar_counter"] = state.get("bar_counter", 0) + 1
+    bar_idx = state["bar_counter"]
+
+    close = round(float(bar["Close"]), 2)
+    high  = round(float(bar["High"]),  2)
+    low   = round(float(bar["Low"]),   2)
+    rsi   = round(float(bar["RSI2"]),  1)
+
+    levels = find_levels(close)
+    state.update({"last_close": close, "last_rsi2": rsi,
+                  "last_levels": levels, "last_bar_time": bar_time})
+
+    log.info(f"Bar: {bar_time} | Close:{close} | RSI2:{rsi} | "
+             f"Bias:{bias} | ATR H1:{h1_atr}")
+
+    # 5. Filter sesi & news
+    if not is_active_session():
+        log.info("Skip: luar sesi")
+        state["daily_skip_session"] = state.get("daily_skip_session", 0) + 1
+        return state
+
+    if is_news_blackout():
+        log.info("Skip: news blackout")
+        state["daily_skip_session"] = state.get("daily_skip_session", 0) + 1
+        return state
+
+    # 6. Deteksi sinyal fade di level $10
+    direction = None
+    level_hit = None
+    wick_extreme = None  # ujung wick untuk SL
+
+    for lvl in levels:
+        # ── SELL: wick sweep di atas level, close di bawah level ───────────
+        if (rsi >= RSI_OB
+                and high > lvl + WICK_MIN      # wick tembus atas level
+                and close < lvl                # close kembali ke bawah
+                and bias != "long"):           # jangan fade melawan uptrend kuat
+            # Filter big bull candle H1 (anti breakout asli)
+            if h1["big_bull"]:
+                log.info(f"Skip SELL: big bull H1 candle di level {lvl}")
+                state["daily_skip_bigcandle"] = state.get("daily_skip_bigcandle", 0) + 1
+                continue
+            direction    = "SELL"
+            level_hit    = lvl
+            wick_extreme = high
+            break
+
+        # ── BUY: wick sweep di bawah level, close di atas level ────────────
+        if (rsi <= RSI_OS
+                and low < lvl - WICK_MIN       # wick tembus bawah level
+                and close > lvl                # close kembali ke atas
+                and bias != "short"):          # jangan fade melawan downtrend kuat
+            # Filter big bear candle H1
+            if h1["big_bear"]:
+                log.info(f"Skip BUY: big bear H1 candle di level {lvl}")
+                state["daily_skip_bigcandle"] = state.get("daily_skip_bigcandle", 0) + 1
+                continue
+            direction    = "BUY"
+            level_hit    = lvl
+            wick_extreme = low
+            break
+
+    if direction is None:
+        return state
+
+    # 7. Anti-spam cooldown
+    alert_key = f"{direction}_{level_hit}"
+    if (state.get("last_alert_key") == alert_key
+            and bar_idx - state.get("last_alert_bar", -999) < COOLDOWN_BARS):
+        log.info(f"Skip cooldown: {alert_key}")
+        return state
+
+    # 8. Hitung SL / TP1 / TP2
+    if direction == "SELL":
+        sl  = round(wick_extreme + SL_BUFFER, 2)
+        tp1 = round(close - h1_atr * TP1_ATR_MULT, 2)
+        tp2 = round(close - h1_atr * TP2_ATR_MULT, 2)
+        risk = round(sl - close, 2)
+        rr1  = round((close - tp1) / risk, 2) if risk > 0 else 0
+        rr2  = round((close - tp2) / risk, 2) if risk > 0 else 0
+        state["daily_sell"] = state.get("daily_sell", 0) + 1
+        header = "🔴 <b>SELL — Round-Number Magnet Fade</b>"
+    else:
+        sl  = round(wick_extreme - SL_BUFFER, 2)
+        tp1 = round(close + h1_atr * TP1_ATR_MULT, 2)
+        tp2 = round(close + h1_atr * TP2_ATR_MULT, 2)
+        risk = round(close - sl, 2)
+        rr1  = round((tp1 - close) / risk, 2) if risk > 0 else 0
+        rr2  = round((tp2 - close) / risk, 2) if risk > 0 else 0
+        state["daily_buy"] = state.get("daily_buy", 0) + 1
+        header = "🟢 <b>BUY — Round-Number Magnet Fade</b>"
+
+    now_wib = _wib_now()
+
+    send_telegram(
+        f"{header}\n\n"
+        f"{'─'*30}\n"
+        f"Level Magnet : <b>${level_hit}</b>\n"
+        f"Entry        : <b>{close}</b>\n"
+        f"SL           : <b>{sl}</b>  (risk: {risk} pts)\n\n"
+        f"TP1 (50%)    : <b>{tp1}</b>  → RR 1:{rr1}\n"
+        f"TP2 (50%)    : <b>{tp2}</b>  → RR 1:{rr2}\n"
+        f"Time stop    : <b>{TIME_STOP_MIN} menit</b> jika belum TP1\n\n"
+        f"{'─'*30}\n"
+        f"RSI(2) M5    : {rsi}\n"
+        f"ATR H1       : {h1_atr}\n"
+        f"Bias H1      : {bias_icon(bias)} {bias}\n"
+        f"EMA50 H1     : {h1['ema50']}\n\n"
+        f"⚠️ <i>Partial close: tutup 50% saat TP1, biarkan 50% ke TP2</i>\n"
+        f"⚠️ <i>Bukan rekomendasi investasi</i>\n\n"
+        f"🕐 {now_wib}"
+    )
+
+    state["last_alert_key"] = alert_key
+    state["last_alert_bar"] = bar_idx
+    return state
+
+# ═══════════════════════════════════════════════
+#  RINGKASAN HARIAN
+# ═══════════════════════════════════════════════
+def send_daily_summary(state: dict) -> dict:
+    today = datetime.now(timezone(timedelta(hours=7))).strftime("%d %b %Y")
+    if state.get("last_summary_day") == today:
+        return state
+
+    buy      = state.get("daily_buy",            0)
+    sell     = state.get("daily_sell",           0)
+    s_atr    = state.get("daily_skip_atr",       0)
+    s_bias   = state.get("daily_skip_bias",      0)
+    s_sess   = state.get("daily_skip_session",   0)
+    s_big    = state.get("daily_skip_bigcandle", 0)
+
+    send_telegram(
+        f"📋 <b>Ringkasan Harian — {today}</b>\n\n"
+        f"🟢 Sinyal BUY  : {buy}x\n"
+        f"🔴 Sinyal SELL : {sell}x\n"
+        f"📊 Total Sinyal: {buy + sell}x\n\n"
+        f"⏭️ Skip ATR H1 ≥ ${ATR_MAX_H1} : {s_atr}x\n"
+        f"⏭️ Skip Bias Neutral         : {s_bias}x\n"
+        f"⏭️ Skip Sesi/News            : {s_sess}x\n"
+        f"⏭️ Skip Big H1 Candle        : {s_big}x\n\n"
+        f"🕐 Update berikutnya: besok 07:00 WIB"
+    )
+
+    state.update({
+        "last_summary_day":     today,
+        "daily_buy":            0,
+        "daily_sell":           0,
+        "daily_skip_atr":       0,
+        "daily_skip_bias":      0,
+        "daily_skip_session":   0,
+        "daily_skip_bigcandle": 0,
+    })
+    return state
+
+# ═══════════════════════════════════════════════
+#  HANDLE PERINTAH TELEGRAM
+# ═══════════════════════════════════════════════
+def handle_commands(state: dict) -> dict:
+    offset  = state.get("tg_offset", 0)
+    updates = get_updates(offset)
+
+    for upd in updates:
+        state["tg_offset"] = upd.get("update_id", 0) + 1
+        text = upd.get("message", {}).get("text", "").strip().lower()
+        if not text:
+            continue
+        log.info(f"Perintah: {text}")
+
+        if text.startswith("/status"):
+            now_wib = _wib_now()
+            bias    = state.get("h1_bias", "-")
+            send_telegram(
+                f"📡 <b>Status Bot — {now_wib}</b>\n\n"
+                f"<b>H1</b>\n"
+                f"Close  : {state.get('h1_close', '-')}\n"
+                f"EMA50  : {state.get('h1_ema50', '-')}\n"
+                f"ATR H1 : {state.get('h1_atr', '-')}  (max: ${ATR_MAX_H1})\n"
+                f"Bias   : {bias_icon(bias)} <b>{bias}</b>\n\n"
+                f"<b>M5 Terakhir</b>\n"
+                f"Close  : {state.get('last_close', '-')}\n"
+                f"RSI(2) : {state.get('last_rsi2', '-')}\n"
+                f"Sesi aktif : {'✅' if is_active_session() else '❌'}\n\n"
+                f"<b>Sinyal Hari Ini</b>\n"
+                f"🟢 BUY  : {state.get('daily_buy', 0)}x\n"
+                f"🔴 SELL : {state.get('daily_sell', 0)}x\n"
+                f"⏭️ Skip : ATR={state.get('daily_skip_atr',0)} "
+                f"Bias={state.get('daily_skip_bias',0)} "
+                f"Sesi={state.get('daily_skip_session',0)} "
+                f"BigCandle={state.get('daily_skip_bigcandle',0)}"
+            )
+
+        elif text.startswith("/bias"):
+            lvls = state.get("last_levels", [])
+            bias = state.get("h1_bias", "-")
+            send_telegram(
+                f"📐 <b>Kondisi Market</b>\n\n"
+                f"Bias H1  : {bias_icon(bias)} <b>{bias}</b>\n"
+                f"EMA50 H1 : {state.get('h1_ema50', '-')}\n"
+                f"ATR H1   : {state.get('h1_atr', '-')}\n\n"
+                f"RSI(2) M5 : {state.get('last_rsi2', '-')}\n"
+                f"Close M5  : {state.get('last_close', '-')}\n\n"
+                f"Level $10 terdekat:\n"
+                + "\n".join(f"  • {l}" for l in lvls) if lvls else "  -"
+            )
+
+        elif text.startswith("/help"):
+            send_telegram(
+                "🤖 <b>RNM Fade Bot v2</b>\n\n"
+                "<b>Perintah:</b>\n"
+                "/status — Snapshot lengkap bot\n"
+                "/bias   — Bias H1, ATR, RSI, level terdekat\n"
+                "/help   — Pesan ini\n\n"
+                "<b>Strategi:</b>\n"
+                "• RSI(2) ≥ 90/≤ 10 di M5\n"
+                "• Level $10 + wick rejection\n"
+                "• Bias H1: EMA50 + slope (skip neutral)\n"
+                "• ATR H1 < $11\n"
+                "• SL: ujung wick + $1.5\n"
+                "• TP1 (50%): 0.5×ATR H1\n"
+                "• TP2 (50%): 1.0×ATR H1\n"
+                "• Time stop: 20 menit jika belum TP1"
+            )
+
+    return state
+
+# ═══════════════════════════════════════════════
+#  UTIL
+# ═══════════════════════════════════════════════
+def _wib_now() -> str:
+    return datetime.now(timezone(timedelta(hours=7))).strftime("%d %b %Y %H:%M WIB")
+
+def seconds_to_next_m5() -> float:
+    now     = datetime.now(timezone.utc).timestamp()
+    elapsed = now % 300
+    return 300 - elapsed + 10   # +10 detik buffer agar candle sudah closed di API
+
+def is_daily_summary_time() -> bool:
+    n = datetime.now(timezone.utc)
+    return n.hour == DAILY_SUMMARY_HOUR_UTC and n.minute < 10
+
+# ═══════════════════════════════════════════════
+#  ENTRY POINT
+# ═══════════════════════════════════════════════
+if __name__ == "__main__":
+    log.info("══════════════════════════════════════════")
+    log.info("  RNM Fade Bot v2 — XAUUSD M5 — Start   ")
+    log.info("══════════════════════════════════════════")
+
+    send_telegram(
+        "🤖 <b>RNM Fade Bot v2 — Aktif</b>\n\n"
+        "Strategi tervalidasi (IS 2010–2019 | OOS 2020–2026)\n"
+        f"WR 62.4% | PF 1.72 | Calmar 13.30 | Sharpe 1.56\n\n"
+        f"⚙️ RSI({RSI_PERIOD}) OB/OS : {RSI_OB}/{RSI_OS}\n"
+        f"⚙️ EMA{EMA_PERIOD} H1 + slope  : bias filter\n"
+        f"⚙️ ATR H1 max    : ${ATR_MAX_H1}\n"
+        f"⚙️ Level step    : ${LEVEL_STEP:g}\n"
+        f"⚙️ SL buffer     : $  {SL_BUFFER}\n"
+        f"⚙️ TP1 / TP2     : {TP1_ATR_MULT}×ATR / {TP2_ATR_MULT}×ATR\n"
+        f"⚙️ Partial close : 50% TP1 + 50% TP2\n\n"
+        "💬 Ketik /help untuk daftar perintah"
+    )
+
+    state = load_state()
+    state = run_check(state)
+    save_state(state)
+
+    while True:
+        state = handle_commands(state)
+        save_state(state)
+
+        wait = seconds_to_next_m5()
+        log.info(f"Tunggu {wait:.0f} detik ke candle berikutnya...")
+        time.sleep(wait)
+
+        state = run_check(state)
+
+        if is_daily_summary_time():
+            state = send_daily_summary(state)
+
+        save_state(state)
 log = logging.getLogger(__name__)
 
 # ═══════════════════════════════════════════════
